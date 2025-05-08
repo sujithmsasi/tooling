@@ -1,42 +1,75 @@
 import pandas as pd
 import json
 
-def flatten_schema(schema, parent=''):
+# -----------------------------------
+# CONFIG: Change these file paths
+# -----------------------------------
+EXCEL_PATH = "resources/missing.xlsx"        # Excel with one column of paths
+JSON_SCHEMA_PATH = "resources/schema.json"  # JSON file with Spark-like schema
 
+# -----------------------------------
+# Helper Functions
+# -----------------------------------
+
+def flatten_schema(schema, parent=""):
     paths = []
-    if schema.get('type') == 'struct':
-        for field in schema.get('fields', []):
-            name = field['name']
-            new_path = f"{parent}/{name}" if parent else f"/{name}"
-            if isinstance(field.get('type'), dict) and field['type'].get('type') == 'struct':
-                # Recurse into nested struct
-                paths.extend(flatten_schema(field['type'], new_path))
-            else:
-                # Leaf field
-                paths.append(new_path)
+
+    def _walk(node, path):
+        # Primitive type (e.g. "string")
+        if isinstance(node, str):
+            paths.append(path)
+            return
+
+        node_type = node.get("type")
+
+        # struct type
+        if node_type == "struct":
+            for field in node.get("fields", []):
+                new_path = f"{path}/{field['name']}" if path else f"/{field['name']}"
+                _walk(field["type"], new_path)
+
+        # array type
+        elif node_type == "array":
+            element_type = node.get("elementType")
+            array_path = f"{path}[]" if path else "/[]"
+            _walk(element_type, array_path)
+
+        # fallback for unexpected
+        else:
+            paths.append(path)
+
+    _walk(schema, parent)
     return paths
 
-# -------- CONFIG --------
-EXCEL_FILE_PATH = "resources/missing.xlsx"   # <-- Replace with actual path
-JSON_SCHEMA_FILE_PATH = "resources/schema.json"  # <-- Replace with actual path
-# ------------------------
+def normalize_path(path):
+    return path.replace("[]", "").strip().lower()
 
-# Load Excel paths
-df = pd.read_excel(EXCEL_FILE_PATH, header=None)
-excel_paths = df[0].dropna().tolist()
-excel_paths = [str(p).strip() for p in excel_paths]
+# -----------------------------------
+# Load Inputs
+# -----------------------------------
 
-# Load JSON schema
-with open(JSON_SCHEMA_FILE_PATH) as f:
+# Load schema JSON
+with open(JSON_SCHEMA_PATH, "r") as f:
     schema = json.load(f)
 
-# Flatten schema
+# Load Excel column (assumes no header)
+df = pd.read_excel(EXCEL_PATH, header=None)
+excel_paths = df[0].dropna().tolist()
+
+# -----------------------------------
+# Flatten Schema and Compare
+# -----------------------------------
+
 schema_paths = flatten_schema(schema)
+schema_paths_normalized = [normalize_path(p) for p in schema_paths]
+excel_paths_normalized = [normalize_path(p) for p in excel_paths]
 
-# Compare
-missing_paths = [path for path in excel_paths if path not in schema_paths]
+missing_paths = [original for original in excel_paths
+                 if normalize_path(original) not in schema_paths_normalized]
 
-# Show result
+# -----------------------------------
+# Output
+# -----------------------------------
 print("Missing Paths:")
 for path in missing_paths:
     print(path)
