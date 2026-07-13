@@ -29,9 +29,6 @@
     - Validates the destination remote and confirms the target branch does
       not already exist there, before any rewriting happens.
     - Rejects remote URLs containing embedded HTTP credentials.
-    - Every user-supplied replacement value is itself checked against the
-      forbidden-pattern list, so a copy-paste mistake can't reintroduce the
-      old identity through the "new" value.
     - Verifies, across EVERY commit (not just HEAD): author/committer
       identity is exactly the new identity; no forbidden text remains in
       any historical blob, commit message, or historical filename.
@@ -257,6 +254,78 @@ function Get-HistoricalPathViolations([string]$Root, [string[]]$Patterns) {
     return $violations
 }
 
+function Test-CommitMessagesClean([string]$Root, [string[]]$Patterns) {
+    # Test-HistoryClean (git grep <rev>) searches each revision's TREE --
+    # file contents at that point in history -- never the commit message
+    # itself, which is metadata on the commit object, not part of any blob.
+    # Nothing else in this script's verification step reads commit messages
+    # either (the identity check only reads %an/%ae/%cn/%ce). That left a
+    # real gap: --replace-message scrubs messages during the REWRITE, but
+    # nothing independently CONFIRMED it worked, so this script could print
+    # "no forbidden references found" while an unscrubbed message still
+    # carried the old identity. Concatenates every commit's raw body (%B)
+    # into one corpus and does the same fixed-string (not regex),
+    # case-insensitive substring search Find-ForbiddenReferences already
+    # uses for file content -- deliberately simple, not per-commit
+    # attribution, since "something in some message still matches" is
+    # already enough to fail closed and prompt a manual
+    # `git log --all --grep` to find which commit.
+    $allMessages = (git -C $Root log --all --format='%B') -join "`n"
+    Assert-LastExit "read commit messages across history"
+
+    $violations = New-Object System.Collections.Generic.List[string]
+    foreach ($pattern in $Patterns) {
+        if ($allMessages.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+            $violations.Add("commit message (some commit) -> $pattern")
+        }
+    }
+    return $violations
+}
+
+function Get-AmbiguousPatterns([string[]]$Patterns, [string[]]$NewIdentityValues) {
+    # A forbidden (old) pattern that is itself a substring of one of the
+    # actual NEW identity values (e.g. new username "Org-Sujith_ace"
+    # legitimately containing old username "Sujith_ace") can never be fully
+    # verified via plain substring matching -- its continued appearance
+    # in the final history is the CORRECT, intended new identity, not proof
+    # of a leftover. Every match of such a pattern is ambiguous going
+    # forward; anything NOT in this set has no legitimate reason to appear
+    # anywhere, so a match of it is unambiguous proof of a real leak.
+    $values = @($NewIdentityValues | Where-Object { $_ })
+    $ambiguous = New-Object System.Collections.Generic.List[string]
+    foreach ($pattern in $Patterns) {
+        foreach ($value in $values) {
+            if ($value.IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+                $ambiguous.Add($pattern)
+                break
+            }
+        }
+    }
+    return $ambiguous
+}
+
+function Split-Violations([string[]]$Violations, [string[]]$AmbiguousPatterns) {
+    # Every violation string produced by Find-ForbiddenReferences /
+    # Test-HistoryClean / Get-HistoricalPathViolations /
+    # Test-CommitMessagesClean ends with "-> <pattern>" -- use that to sort
+    # each violation into "ambiguous" (matched a pattern that's also part of
+    # a real new-identity value -- expected, not fatal) or "fatal"
+    # (matched a pattern with no legitimate reason to appear -- a real leak).
+    $fatal = New-Object System.Collections.Generic.List[string]
+    $ambiguousOut = New-Object System.Collections.Generic.List[string]
+    foreach ($violation in $Violations) {
+        $isAmbiguous = $false
+        foreach ($pattern in $AmbiguousPatterns) {
+            if ($violation.EndsWith("-> $pattern", [System.StringComparison]::OrdinalIgnoreCase)) {
+                $isAmbiguous = $true
+                break
+            }
+        }
+        if ($isAmbiguous) { $ambiguousOut.Add($violation) } else { $fatal.Add($violation) }
+    }
+    return [pscustomobject]@{ Fatal = $fatal; Ambiguous = $ambiguousOut }
+}
+
 # ---------------------------------------------------------------------------
 # 0. Source preconditions
 # ---------------------------------------------------------------------------
@@ -428,14 +497,34 @@ $deliverableInputs = [ordered]@{
     'remote name' = $remoteName
     'target branch' = $targetBranch
 }
-foreach ($entry in $deliverableInputs.GetEnumerator()) {
-    foreach ($pattern in $forbiddenPatterns) {
-        if ([string]$entry.Value -and
-            ([string]$entry.Value).IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
-            Write-Host "The $($entry.Key) still contains forbidden legacy value '$pattern'." -ForegroundColor Red
-            exit 1
-        }
-    }
+# Disabled: this pre-flight substring check against $forbiddenPatterns
+# false-positived on legitimate new-identity values that happen to share a
+# word with the old username/email (e.g. an org name containing the same
+# name the old username was derived from). The real safety net -- scanning
+# the REWRITTEN HISTORY CONTENT for leftover old identity -- is untouched
+# below (Find-ForbiddenReferences / Test-HistoryClean /
+# Get-HistoricalPathViolations / Test-CommitMessagesClean); this only
+# disabled the input-typo guard on the 7 new-identity prompts themselves.
+#
+# foreach ($entry in $deliverableInputs.GetEnumerator()) {
+#     foreach ($pattern in $forbiddenPatterns) {
+#         if ([string]$entry.Value -and
+#             ([string]$entry.Value).IndexOf($pattern, [System.StringComparison]::OrdinalIgnoreCase) -ge 0) {
+#             Write-Host "The $($entry.Key) still contains forbidden legacy value '$pattern'." -ForegroundColor Red
+#             exit 1
+#         }
+#     }
+# }
+
+# Computed once, here, right after every new-identity value is final --
+# reused by both post-rewrite verification passes below (fallback tree-only
+# check and the full-history check) so a pattern that's legitimately part of
+# the chosen new identity (e.g. new username "Org-Sujith_ace" containing old
+# username "Sujith_ace") is never treated as a fatal leak in either path.
+$ambiguousPatterns = @(Get-AmbiguousPatterns $forbiddenPatterns @($newName, $newEmail, $usernameReplacement, $orgRemoteUrl, $publicRepoUrl))
+if ($ambiguousPatterns.Count -gt 0) {
+    Write-Host "Note: your new identity value(s) legitimately contain the following old pattern(s) as a substring -- their continued appearance in the rewritten history will be treated as expected, not a leak:" -ForegroundColor Yellow
+    $ambiguousPatterns | ForEach-Object { Write-Host "  $_" }
 }
 
 # ---------------------------------------------------------------------------
@@ -582,25 +671,76 @@ Set-Utf8NoBomContent $mailmapFile @(
 )
 
 if ($haveFilterRepo) {
-    # Regex mode with an inline case-insensitive flag, most-specific pattern
-    # first -- e.g. the full ".git"-suffixed clone URL must be consumed before
-    # the bare-username rule gets a chance to partially mangle it, since
-    # filter-repo applies each line in file order to the running text. Built
-    # per old username so multiple historical usernames are all covered.
+    # Two-phase token indirection (old pattern -> unique token -> final
+    # value) -- NOT old-pattern -> final-value directly. filter-repo applies
+    # every line in this file sequentially to the running text, so a rule's
+    # OUTPUT is visible to every rule listed after it. If any "new" value
+    # itself contains one of the "old" patterns as a substring -- entirely
+    # plausible, e.g. a new org username that keeps a personal handle as a
+    # suffix ("Org-Sujith_ace" containing old username "Sujith_ace") -- an
+    # earlier rule inserting that new value creates fresh text that a later
+    # old-pattern rule then partially re-matches and re-replaces, corrupting
+    # the result (e.g. "Org-Org-Sujith_ace"). Confirmed via a real run that
+    # hit exactly this. Routing every old pattern to a unique,
+    # nothing-like-real-data token first, with ALL token->final-value
+    # substitutions deferred to their own rules at the very end of the file,
+    # makes that impossible: no old-pattern rule ever runs after a final
+    # value has been written into the text. This mirrors the
+    # $tokenRules/$tokenValues two-phase approach the filter-branch fallback
+    # below already uses (that path was never vulnerable to this, since its
+    # two phases were already separate loops) -- this brings the primary
+    # path in line with it.
     $replaceTextFile = Join-Path $migrationRoot 'replace-text.txt'
     $replaceTextLines = New-Object System.Collections.Generic.List[string]
+
+    $tokenRemoteGit     = '__ZAMBONI_ORG_REMOTE_GIT__'
+    $tokenRemoteDisplay = '__ZAMBONI_ORG_REMOTE_DISPLAY__'
+    $tokenEmail         = '__ZAMBONI_ORG_EMAIL__'
+    $tokenUsername      = '__ZAMBONI_ORG_USERNAME__'
+
     foreach ($oldUser in $oldUsernames) {
-        $replaceTextLines.Add("regex:(?i)https://github\.com/$oldUser/zamboni\.git==>$orgRemoteUrl")
-        $replaceTextLines.Add("regex:(?i)git@github\.com:$oldUser/zamboni\.git==>$orgRemoteUrl")
-        $replaceTextLines.Add("regex:(?i)https://github\.com/$oldUser/zamboni==>$publicRepoUrl")
-        $replaceTextLines.Add("regex:(?i)github\.com/$oldUser/zamboni==>$publicRepoUrl")
+        # Escaped: the input validation above allows '.' (a regex
+        # metacharacter -- real GitHub usernames can't actually contain one,
+        # but this script's own validation is more permissive than that), so
+        # an unescaped $oldUser here could match more than the literal
+        # username wherever a '.' appears in place of any character.
+        $escapedOldUser = [System.Text.RegularExpressions.Regex]::Escape($oldUser)
+        $replaceTextLines.Add("regex:(?i)https://github\.com/$escapedOldUser/zamboni\.git==>$tokenRemoteGit")
+        $replaceTextLines.Add("regex:(?i)git@github\.com:$escapedOldUser/zamboni\.git==>$tokenRemoteGit")
+        $replaceTextLines.Add("regex:(?i)https://github\.com/$escapedOldUser/zamboni==>$tokenRemoteDisplay")
+        $replaceTextLines.Add("regex:(?i)github\.com/$escapedOldUser/zamboni==>$tokenRemoteDisplay")
     }
     $escapedOldEmail = [System.Text.RegularExpressions.Regex]::Escape($oldEmail)
-    $replaceTextLines.Add("regex:(?i)$escapedOldEmail==>$newEmail")
-    $replaceTextLines.Add("regex:(?i)noreply@github\.com==>$newEmail")
+    $replaceTextLines.Add("regex:(?i)$escapedOldEmail==>$tokenEmail")
+    $replaceTextLines.Add("regex:(?i)noreply@github\.com==>$tokenEmail")
     foreach ($oldUser in $oldUsernames) {
-        $replaceTextLines.Add("regex:(?i)$oldUser==>$usernameReplacement")
+        # This rule has no surrounding literal context (unlike the four
+        # github.com/... rules above) to naturally bound the match, so a
+        # short/common username could otherwise over-match as a substring
+        # of unrelated words anywhere in history (e.g. username "jo" inside
+        # "enjoy"). Escaped + bounded with lookaround on both sides -- but
+        # ONLY against letters/digits/underscore, deliberately excluding
+        # '.' and '-' from the boundary class. Confirmed via a live test
+        # run against a throwaway repo: a commit message reading "...thanks
+        # faketestuser123-helper for the review" is a genuine mention of
+        # username "faketestuser123", not an unrelated word it happens to
+        # be a substring of -- an earlier version of this rule that also
+        # excluded '.'/'-' from matching *adjacent* to the username (i.e.
+        # treated them as non-boundary "word" characters, matching this
+        # script's own username-validation charset) left that occurrence
+        # unscrubbed, only caught afterward by Test-CommitMessagesClean's
+        # independent, unbounded verification scan.
+        $escapedOldUser = [System.Text.RegularExpressions.Regex]::Escape($oldUser)
+        $replaceTextLines.Add("regex:(?i)(?<![A-Za-z0-9_])$escapedOldUser(?![A-Za-z0-9_])==>$tokenUsername")
     }
+
+    # Phase 2 -- tokens to final values, deliberately listed last so no
+    # old-pattern rule above can ever run against an already-final value.
+    $replaceTextLines.Add("$tokenRemoteGit==>$orgRemoteUrl")
+    $replaceTextLines.Add("$tokenRemoteDisplay==>$publicRepoUrl")
+    $replaceTextLines.Add("$tokenEmail==>$newEmail")
+    $replaceTextLines.Add("$tokenUsername==>$usernameReplacement")
+
     Set-Utf8NoBomContent $replaceTextFile $replaceTextLines
 
     $filterRepoArgs = New-Object System.Collections.Generic.List[string]
@@ -611,6 +751,16 @@ if ($haveFilterRepo) {
     $filterRepoArgs.Add('--mailmap'); $filterRepoArgs.Add($mailmapFile)
     $filterRepoArgs.Add('--replace-text'); $filterRepoArgs.Add($replaceTextFile)
     $filterRepoArgs.Add('--replace-message'); $filterRepoArgs.Add($replaceTextFile)
+    # filter-repo's default ('auto') prunes a commit that becomes empty after
+    # --invert-paths removes its only changes (e.g. a commit that touched
+    # only zamboni_local.db) -- silently contradicting this script's own
+    # stated guarantee that "every commit on the current branch is kept."
+    # 'never' on both forces every commit (and every merge, even one that
+    # becomes degenerate -- fewer than two distinct parents -- after
+    # filtering) to survive, matching that guarantee instead of the
+    # commit-count check below just shrugging at a mismatch.
+    $filterRepoArgs.Add('--prune-empty'); $filterRepoArgs.Add('never')
+    $filterRepoArgs.Add('--prune-degenerate'); $filterRepoArgs.Add('never')
 
     git -C $isolatedRepo @filterRepoArgs
     Assert-LastExit "git filter-repo rewrite"
@@ -690,10 +840,14 @@ fi
     }
     Write-Host "Scrubbed $changedFiles file(s) in the final tree."
 
-    $treeViolations = @(Find-ForbiddenReferences $isolatedRepo $forbiddenPatterns)
-    if ($treeViolations.Count -gt 0) {
+    $treeViolationsSplit = Split-Violations (Find-ForbiddenReferences $isolatedRepo $forbiddenPatterns) $ambiguousPatterns
+    if ($treeViolationsSplit.Ambiguous.Count -gt 0) {
+        Write-Host "Expected matches in the final tree (your new identity legitimately contains an old pattern, not a leak):" -ForegroundColor Yellow
+        $treeViolationsSplit.Ambiguous | ForEach-Object { Write-Host "  $_" }
+    }
+    if ($treeViolationsSplit.Fatal.Count -gt 0) {
         Write-Host "Forbidden references remain in the final tree after fallback scrub:" -ForegroundColor Red
-        $treeViolations | ForEach-Object { Write-Host "  $_" }
+        $treeViolationsSplit.Fatal | ForEach-Object { Write-Host "  $_" }
         exit 1
     }
 
@@ -719,8 +873,15 @@ if ($finalCommitCount -eq 0) {
 }
 Write-Host "Commits before rewrite: $sourceCommitCount"
 Write-Host "Commits after rewrite : $finalCommitCount"
+# --prune-empty never --prune-degenerate never (filter-repo path) and the
+# fallback's filter-branch invocation (which never passes --prune-empty at
+# all) both guarantee no commit is ever dropped -- so unlike before, a
+# mismatch here now means something unexpected happened, not an accepted
+# side effect of pruning. Refusing to push is safer than silently trusting
+# a rewrite that didn't preserve the commit this script promises to.
 if ($finalCommitCount -ne $sourceCommitCount) {
-    Write-Host "(Difference is expected if any commit became empty after removing excluded paths -- filter-repo/filter-branch prune those.)" -ForegroundColor Yellow
+    Write-Host "Commit count changed during rewrite ($sourceCommitCount -> $finalCommitCount). This script guarantees every commit survives (no pruning is requested) -- refusing to push." -ForegroundColor Red
+    exit 1
 }
 
 $identityLines = @(git -C $isolatedRepo log --all --format='%an|%ae|%cn|%ce' | Select-Object -Unique)
@@ -735,7 +896,14 @@ Write-Host "Every commit's author/committer is $newName <$newEmail>." -Foregroun
 
 $contentViolations = @(Test-HistoryClean $isolatedRepo $forbiddenPatterns)
 $pathViolations = @(Get-HistoricalPathViolations $isolatedRepo $forbiddenPatterns)
-$allViolations = @($contentViolations) + @($pathViolations)
+$messageViolations = @(Test-CommitMessagesClean $isolatedRepo $forbiddenPatterns)
+$allViolationsSplit = Split-Violations (@($contentViolations) + @($pathViolations) + @($messageViolations)) $ambiguousPatterns
+$allViolations = $allViolationsSplit.Fatal
+
+if ($allViolationsSplit.Ambiguous.Count -gt 0) {
+    Write-Host "Expected matches across history (your new identity legitimately contains an old pattern, not a leak):" -ForegroundColor Yellow
+    $allViolationsSplit.Ambiguous | ForEach-Object { Write-Host "  $_" }
+}
 
 if ($allViolations.Count -gt 0) {
     if ($haveFilterRepo) {
@@ -750,7 +918,7 @@ if ($allViolations.Count -gt 0) {
     }
 }
 else {
-    Write-Host "No forbidden references found anywhere in history." -ForegroundColor Green
+    Write-Host "No unexpected forbidden references found anywhere in history." -ForegroundColor Green
 }
 
 # ---------------------------------------------------------------------------
