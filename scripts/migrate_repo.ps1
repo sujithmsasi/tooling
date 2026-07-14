@@ -397,6 +397,67 @@ foreach ($oldUser in $oldUsernames) {
         Write-Host "GitHub username '$oldUser' may contain only letters, digits, '.', '_' and '-'." -ForegroundColor Red
         exit 1
     }
+    # Each entry here becomes a bounded-but-unanchored regex match
+    # (line ~734: (?<![A-Za-z0-9_])$escapedOldUser(?![A-Za-z0-9_])) applied
+    # to EVERY historical blob and commit message, not just genuine username
+    # mentions. A short or purely-numeric entry (a stray "5" from a
+    # mis-pasted list, a typo, a copy/paste artifact) matches constants,
+    # version numbers, and other innocuous standalone tokens throughout the
+    # codebase and silently replaces them too -- confirmed via a real
+    # incident where a single-character entry clobbered a safety constant
+    # in config/settings.py. Real GitHub usernames are always 1-39 chars,
+    # but requiring >= 4 and rejecting purely-numeric entries costs nothing
+    # for a legitimate username while closing off the two shapes most
+    # likely to be an accidental short/generic token.
+    if ($oldUser.Length -lt 4 -or $oldUser -match '^[0-9]+$') {
+        Write-Host "GitHub username '$oldUser' is too short or purely numeric to safely scrub -- it would be blanket-replaced everywhere it appears as a standalone token across the ENTIRE history (constants, version numbers, etc.), not just genuine username mentions. Re-run and enter your real GitHub username(s) only." -ForegroundColor Red
+        exit 1
+    }
+}
+
+# Length/numeric checks above catch a stray "5", but not a real English word
+# entered by mistake (e.g. "claude", "sonnet" -- confirmed via a real
+# incident where both were entered as "old usernames," each blanket-matching
+# every standalone mention of those words in every file across all of
+# history, not just genuine username references). A full `git grep --all`
+# scan is what the (much slower) post-rewrite verification already does --
+# too expensive to run here as a pre-check. Counting matches in HEAD alone
+# is a fast, reliable proxy instead: HEAD already contains the overwhelming
+# majority of surviving content, and a genuine GitHub username realistically
+# appears a handful of times (a git remote URL, maybe a couple of
+# authorship mentions) while a common word or stray token appears dozens to
+# thousands of times.
+Write-Section "Sanity-checking scrub patterns against HEAD"
+$MAX_SAFE_HEAD_MATCHES = 25
+foreach ($oldUser in $oldUsernames) {
+    $escapedOldUser = [System.Text.RegularExpressions.Regex]::Escape($oldUser)
+    $boundedPattern = "(?<![A-Za-z0-9_])$escapedOldUser(?![A-Za-z0-9_])"
+    # -P (PCRE), not -E (POSIX extended) -- confirmed via a live test that -E
+    # errors out (exit 128, invalid regex) on the (?<!...)/(?!...) lookaround
+    # this bounded pattern needs, since POSIX ERE has no lookaround syntax at
+    # all; -P is what makes it behave like a real "no match" instead of a
+    # crash.
+    $countResult = Invoke-GitCapture -Arguments @('grep', '-a', '-i', '-c', '-P', $boundedPattern, 'HEAD')
+    $totalMatches = 0
+    if ($countResult.ExitCode -eq 0) {
+        foreach ($line in $countResult.Output) {
+            if ([string]$line -match ':(\d+)$') { $totalMatches += [int]$Matches[1] }
+        }
+    }
+    elseif ($countResult.ExitCode -ne 1) {
+        # 1 == no matches (fine); anything else is a real grep error.
+        Stop-GitFailure "sanity-check scrub pattern '$oldUser' against HEAD" $countResult.ExitCode
+    }
+
+    if ($totalMatches -gt $MAX_SAFE_HEAD_MATCHES) {
+        Write-Host "'$oldUser' matches $totalMatches time(s) in the current HEAD tree alone -- this looks like a common word or generic token, not a real GitHub username." -ForegroundColor Red
+        Write-Host "Scrubbing it will blanket-replace every one of those occurrences (and every occurrence across all of history) with the org replacement token, whether or not it's actually a username reference there." -ForegroundColor Red
+        Write-Host "First few matches:" -ForegroundColor Yellow
+        $sampleResult = Invoke-GitCapture -Arguments @('grep', '-a', '-i', '-n', '-P', $boundedPattern, 'HEAD')
+        $sampleResult.Output | Select-Object -First 5 | ForEach-Object { Write-Host "  $_" }
+        Write-Host "If '$oldUser' is genuinely your GitHub username and this is a coincidence, confirm below to proceed anyway." -ForegroundColor Yellow
+        Confirm-Word "Proceed with scrubbing '$oldUser' despite the high match count" "CONFIRM-SCRUB"
+    }
 }
 
 do {
@@ -466,6 +527,19 @@ if ([string]::IsNullOrWhiteSpace($targetBranch)) { $targetBranch = 'new-phase1' 
 $targetBranch = $targetBranch.Trim()
 git check-ref-format --branch $targetBranch *> $null
 Assert-LastExit "validate target branch name"
+
+# The rewritten history has its own brand-new root commit (filter-repo/
+# filter-branch never share an ancestor with anything already on the org
+# remote) -- pushing it as a bare new branch and then opening a PR against
+# an existing branch that already has content produces "unrelated
+# histories," which GitHub's compare view surfaces as no diff at all (reads
+# like "I can't see any change," not an error) -- confirmed via a real
+# incident. If the org branch below already has real content, this script
+# rebuilds the rewritten commits as patches on top of it (git format-patch +
+# git am) instead of pushing a disconnected branch, so the result shares a
+# real ancestor and a PR against it shows a normal diff.
+$orgBaseBranch = Read-Host "Org branch to base this on / open the PR against, if it already has content -- leave blank if the org repo is brand new/empty"
+$orgBaseBranch = $orgBaseBranch.Trim()
 
 $remoteWithoutGitSuffix = ($orgRemoteUrl -replace '(?i)\.git$', '')
 $defaultPublicUrl = $remoteWithoutGitSuffix
@@ -606,6 +680,7 @@ Write-Host "Username replacement   : $usernameReplacement"
 Write-Host "Org remote             : $orgRemoteUrl"
 Write-Host "Public repository URL  : $publicRepoUrl"
 Write-Host "New branch             : $targetBranch"
+Write-Host "Base branch (for PR)   : $(if ($orgBaseBranch) { $orgBaseBranch } else { '(none -- pushed as a standalone new branch)' })"
 Write-Host "History                : PRESERVED (every commit rewritten, new hashes)"
 Write-Host "Rewrite engine         : $(if ($haveFilterRepo) { 'git-filter-repo (full)' } else { 'git filter-branch (reduced guarantees)' })"
 Write-Host "Source repository      : remains untouched"
@@ -743,6 +818,20 @@ if ($haveFilterRepo) {
 
     Set-Utf8NoBomContent $replaceTextFile $replaceTextLines
 
+    # A SEPARATE file for --replace-message only -- deliberately not folded
+    # into $replaceTextFile, which also feeds --replace-text (file content).
+    # "Claude Sonnet 5" -> "Claude" is a commit-message display-name
+    # simplification (the Co-Authored-By trailer this tool writes), not an
+    # old-identity leak: applying it to file content too would also rewrite
+    # the literal model-id string ("claude-sonnet-5") wherever it's used as
+    # a real technical reference (e.g. config/model selection), which is a
+    # different, unrelated string this script has no business touching.
+    $replaceMessageFile = Join-Path $migrationRoot 'replace-message.txt'
+    $replaceMessageLines = New-Object System.Collections.Generic.List[string]
+    $replaceMessageLines.AddRange($replaceTextLines)
+    $replaceMessageLines.Add('regex:(?i)\bClaude Sonnet 5\b==>Claude')
+    Set-Utf8NoBomContent $replaceMessageFile $replaceMessageLines
+
     $filterRepoArgs = New-Object System.Collections.Generic.List[string]
     $filterRepoArgs.Add('filter-repo'); $filterRepoArgs.Add('--force'); $filterRepoArgs.Add('--invert-paths')
     foreach ($path in $excludedPaths) {
@@ -750,7 +839,7 @@ if ($haveFilterRepo) {
     }
     $filterRepoArgs.Add('--mailmap'); $filterRepoArgs.Add($mailmapFile)
     $filterRepoArgs.Add('--replace-text'); $filterRepoArgs.Add($replaceTextFile)
-    $filterRepoArgs.Add('--replace-message'); $filterRepoArgs.Add($replaceTextFile)
+    $filterRepoArgs.Add('--replace-message'); $filterRepoArgs.Add($replaceMessageFile)
     # filter-repo's default ('auto') prunes a commit that becomes empty after
     # --invert-paths removes its only changes (e.g. a commit that touched
     # only zamboni_local.db) -- silently contradicting this script's own
@@ -766,6 +855,7 @@ if ($haveFilterRepo) {
     Assert-LastExit "git filter-repo rewrite"
 
     Remove-Item $replaceTextFile -ErrorAction SilentlyContinue
+    Remove-Item $replaceMessageFile -ErrorAction SilentlyContinue
 }
 else {
     $env:FILTER_BRANCH_SQUELCH_WARNING = "1"
@@ -932,24 +1022,89 @@ Write-Host "Remote '$remoteName' -> $orgRemoteUrl"
 Write-Host "Prepared branch tip:" -ForegroundColor Green
 git -C $isolatedRepo log -1 --format='  %h  %an <%ae>  %s'
 
+$pushRef = 'HEAD'  # what actually gets pushed -- becomes a rebuilt branch below if $orgBaseBranch is set
+
+if ($orgBaseBranch) {
+    Write-Section "Fetching org branch '$orgBaseBranch'"
+    $baseFetchResult = Invoke-GitCapture -Arguments @('-C', $isolatedRepo, 'fetch', $remoteName, $orgBaseBranch)
+    if ($baseFetchResult.ExitCode -ne 0) {
+        Write-Host "Could not fetch org branch '$orgBaseBranch' -- it may not exist yet. Falling back to pushing a standalone new branch." -ForegroundColor Yellow
+        $baseFetchResult.Output | ForEach-Object { Write-Host "  $_" }
+        $orgBaseBranch = ''
+    }
+}
+
+if ($orgBaseBranch) {
+    Write-Section "Rebuilding onto '$orgBaseBranch' (so the PR shows a real diff)"
+
+    # git format-patch/git am replay each commit as an independent diff --
+    # correct for a linear history (this script's design goal, "every commit
+    # kept"), but a merge commit's second parent can't be reconstructed this
+    # way. Confirmed there's no silent partial-replay risk by refusing
+    # outright if any merge commit exists, rather than only warning.
+    $mergeCommits = @(git -C $isolatedRepo rev-list --min-parents=2 --all)
+    Assert-LastExit "check for merge commits"
+    if ($mergeCommits.Count -gt 0) {
+        Write-Host "The rewritten history contains $($mergeCommits.Count) merge commit(s). git format-patch/git am cannot losslessly replay a merge commit onto another branch -- rebuilding onto '$orgBaseBranch' is not safe here." -ForegroundColor Red
+        Write-Host "Re-run and leave the base-branch prompt blank to push as a standalone new branch instead, or handle this merge history manually." -ForegroundColor Red
+        exit 1
+    }
+
+    $patchDir = Join-Path $migrationRoot 'patches'
+    New-Item -ItemType Directory -Path $patchDir *> $null
+    git -C $isolatedRepo format-patch --root --output-directory $patchDir HEAD *> $null
+    Assert-LastExit "generate patches from rewritten history"
+    $patchFiles = @(Get-ChildItem -LiteralPath $patchDir -Filter '*.patch' | Sort-Object Name | ForEach-Object { $_.FullName })
+    if ($patchFiles.Count -ne $finalCommitCount) {
+        Write-Host "Generated $($patchFiles.Count) patch(es) but expected $finalCommitCount -- refusing to proceed." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Generated $($patchFiles.Count) patch(es)."
+
+    $rebuildBranch = "$targetBranch-onto-$orgBaseBranch"
+    git -C $isolatedRepo checkout -b $rebuildBranch "$remoteName/$orgBaseBranch"
+    Assert-LastExit "create rebuild branch from org '$orgBaseBranch'"
+
+    $amResult = Invoke-GitCapture -Arguments (@('-C', $isolatedRepo, '-c', "user.name=$newName", '-c', "user.email=$newEmail", 'am') + $patchFiles)
+    if ($amResult.ExitCode -ne 0) {
+        Write-Host "Applying patches onto '$orgBaseBranch' failed -- a real conflict between these changes and what's already on that branch:" -ForegroundColor Red
+        $amResult.Output | ForEach-Object { Write-Host "  $_" }
+        Write-Host "Resolve manually inside $isolatedRepo (git am --show-current-patch to see the stuck patch, git am --abort to bail out and try something else), or re-run with a different/blank base branch." -ForegroundColor Red
+        exit 1
+    }
+    Write-Host "Applied $($patchFiles.Count) patch(es) onto '$orgBaseBranch'." -ForegroundColor Green
+
+    $rebuiltCount = [int](git -C $isolatedRepo rev-list "$remoteName/$orgBaseBranch..HEAD" --count)
+    Assert-LastExit "count rebuilt commits"
+    if ($rebuiltCount -ne $finalCommitCount) {
+        Write-Host "Rebuilt branch has $rebuiltCount commit(s) ahead of '$orgBaseBranch', expected $finalCommitCount -- refusing to push." -ForegroundColor Red
+        exit 1
+    }
+    $pushRef = $rebuildBranch
+    Write-Host "This branch now shares real history with '$orgBaseBranch' -- a PR against it will show a normal diff instead of 'unrelated histories.'" -ForegroundColor Green
+}
+
 Write-Section "Validating push"
 
-git -C $isolatedRepo push --dry-run $remoteName "HEAD:refs/heads/$targetBranch"
+git -C $isolatedRepo push --dry-run $remoteName "${pushRef}:refs/heads/$targetBranch"
 Assert-LastExit "dry-run push"
 Write-Host "Dry-run push succeeded." -ForegroundColor Green
-Write-Host "About to create NEW remote branch '$targetBranch' with $finalCommitCount commit(s)."
+Write-Host "About to create NEW remote branch '$targetBranch' with $finalCommitCount commit(s)$(if ($orgBaseBranch) { " on top of '$orgBaseBranch'" })."
 if ($allViolations.Count -gt 0) {
     Write-Host "NOTE: known residual references in older commits are listed above." -ForegroundColor Yellow
 }
 Confirm-Word "Push the rewritten history now" "PUSH"
 
-git -C $isolatedRepo push -u $remoteName "HEAD:refs/heads/$targetBranch"
+git -C $isolatedRepo push -u $remoteName "${pushRef}:refs/heads/$targetBranch"
 Assert-LastExit "push rewritten history"
 
 Write-Section "Migration complete"
-git -C $isolatedRepo log -1 --format='  %H  %an <%ae>  %s'
+git -C $isolatedRepo log -1 --format='  %H  %an <%ae>  %s' $pushRef
 Write-Host ""
 Write-Host "Isolated rewritten repository: $isolatedRepo"
 Write-Host "Sensitive source-history backup: $script:backupPath" -ForegroundColor Yellow
 Write-Host "Verify the org repository independently before deleting either local artifact."
 Write-Host "The source repository was not modified. Tags/other branches were not pushed."
+if ($orgBaseBranch) {
+    Write-Host "Open a PR from '$targetBranch' into '$orgBaseBranch' on the org remote -- it now shares real history, so the diff will show your actual changes." -ForegroundColor Green
+}
