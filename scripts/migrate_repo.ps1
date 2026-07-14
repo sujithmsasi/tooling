@@ -489,6 +489,15 @@ do {
         Write-Host "Enter a valid email address." -ForegroundColor Yellow
         $newEmail = ''
     }
+    elseif ($newEmail.Contains('\')) {
+        # Same reasoning as the org remote URL's backslash check below: this
+        # value becomes the replacement side of a regex:-prefixed
+        # --replace-text/--replace-message rule (see the "Phase 2" fix
+        # below), and a backslash in a Python re.sub() replacement string is
+        # a backreference/escape sequence, not a literal character.
+        Write-Host "Email contains a backslash -- unsafe as a regex replacement value." -ForegroundColor Yellow
+        $newEmail = ''
+    }
 } while ([string]::IsNullOrWhiteSpace($newEmail))
 
 $usernameReplacement = Read-Host "Replacement for public usernames [your-org-username]"
@@ -811,10 +820,32 @@ if ($haveFilterRepo) {
 
     # Phase 2 -- tokens to final values, deliberately listed last so no
     # old-pattern rule above can ever run against an already-final value.
-    $replaceTextLines.Add("$tokenRemoteGit==>$orgRemoteUrl")
-    $replaceTextLines.Add("$tokenRemoteDisplay==>$publicRepoUrl")
-    $replaceTextLines.Add("$tokenEmail==>$newEmail")
-    $replaceTextLines.Add("$tokenUsername==>$usernameReplacement")
+    #
+    # MUST be regex:-prefixed, not plain literal rules -- confirmed via a
+    # real incident plus direct isolated testing against git filter-repo:
+    # it internally applies every PLAIN (non-regex:) --replace-text rule in
+    # one pass, THEN every regex: rule in a second pass, regardless of the
+    # order rules appear in the file. Phase 1 above is regex: (old pattern
+    # -> token); a plain-literal phase 2 (token -> final value) therefore
+    # ran in the FIRST pass, before phase 1's regex pass ever produced the
+    # token text to match against -- so the token was left in the final
+    # output, unresolved, in every historical commit. Making phase 2
+    # regex: too puts both phases in the SAME (second) pass, applied in
+    # file order, so phase 2 correctly sees phase 1's freshly-inserted
+    # tokens. The replacement (right-hand) side goes through Python's
+    # re.sub(), where a backslash is a backreference/escape sequence, not
+    # a literal character -- $orgRemoteUrl/$publicRepoUrl/$usernameReplacement
+    # are already validated elsewhere to reject backslashes, and $newEmail
+    # now is too (see its prompt above), so Regex.Escape() is only needed
+    # on the search (left-hand) side here.
+    $escapedTokenRemoteGit = [System.Text.RegularExpressions.Regex]::Escape($tokenRemoteGit)
+    $escapedTokenRemoteDisplay = [System.Text.RegularExpressions.Regex]::Escape($tokenRemoteDisplay)
+    $escapedTokenEmail = [System.Text.RegularExpressions.Regex]::Escape($tokenEmail)
+    $escapedTokenUsername = [System.Text.RegularExpressions.Regex]::Escape($tokenUsername)
+    $replaceTextLines.Add("regex:$escapedTokenRemoteGit==>$orgRemoteUrl")
+    $replaceTextLines.Add("regex:$escapedTokenRemoteDisplay==>$publicRepoUrl")
+    $replaceTextLines.Add("regex:$escapedTokenEmail==>$newEmail")
+    $replaceTextLines.Add("regex:$escapedTokenUsername==>$usernameReplacement")
 
     Set-Utf8NoBomContent $replaceTextFile $replaceTextLines
 
