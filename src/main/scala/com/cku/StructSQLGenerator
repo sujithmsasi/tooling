@@ -1,0 +1,88 @@
+import org.apache.spark.sql.{DataFrame, SparkSession}
+import scala.collection.mutable
+import scala.io.Source
+import java.io.{File, PrintWriter}
+
+object StructSQLGenerator {
+
+  def extractParts(path: String): Array[String] = {
+    if (path != null && path.startsWith("/")) path.stripPrefix("/").split("/") else Array.empty
+  }
+
+  def generateCoalesceExpr(vPPath: String, dqPath: String, cftVal: String): String = {
+    val vol = vPPath.stripPrefix("/").replace("/", "_")
+    val eqd = dqPath.stripPrefix("/").replace("/", "_")
+    s"COALESCE(vpay_$vol, eqd_$eqd, $cftVal)"
+  }
+
+  def insertIntoTree(tree: mutable.Map[String, Any], pathParts: Array[String], value: String): Unit = {
+    if (pathParts.length == 1) {
+      tree(pathParts.head) = value
+    } else {
+      val head = pathParts.head
+      val tail = pathParts.tail
+      val subtree = tree.getOrElseUpdate(head, mutable.Map.empty[String, Any]).asInstanceOf[mutable.Map[String, Any]]
+      insertIntoTree(subtree, tail, value)
+    }
+  }
+
+  def generateSqlBlock(tree: mutable.Map[String, Any], indent: Int = 0): String = {
+    val lines = tree.map {
+      case (key, value: mutable.Map[_, _]) =>
+        val subBlock = generateSqlBlock(value.asInstanceOf[mutable.Map[String, Any]], indent + 2)
+        " " * indent + s"struct(\n$subBlock\n${" " * indent}) AS $key,"
+      case (key, value: String) =>
+        " " * indent + value + ","
+    }.toList
+
+    lines.map(_.stripSuffix(",")).mkString("\n")
+  }
+
+  def generateStructSqlFromMapping(df: DataFrame): String = {
+    val nestedStructs = mutable.Map[String, Any]()
+    val rows = df.collect()
+
+    rows.foreach { row =>
+      val volPath = row.getAs[String]("vpay")
+      val dqPath = row.getAs[String]("eqd")
+      var cftVal = row.getAs[String]("cft")
+
+      if (cftVal == null || cftVal == "NA") cftVal = "NA"
+      else cftVal = cftVal.replace(".", "_")
+
+      if (volPath == null || !volPath.startsWith("/")) return
+
+      val volParts = extractParts(volPath)
+      val eqdParts = extractParts(dqPath)
+
+      if (volParts.length != eqdParts.length || !volParts.dropRight(1).sameElements(eqdParts.dropRight(1))) return
+
+      val alias = volParts.last
+      val expr = generateCoalesceExpr(volPath, dqPath, cftVal) + s" AS $alias"
+      insertIntoTree(nestedStructs, volParts, expr)
+    }
+
+    generateSqlBlock(nestedStructs, 0).stripSuffix(",")
+  }
+
+  def main(args: Array[String]): Unit = {
+    val spark = SparkSession.builder().appName("Struct SQL Generator").master("local[*]").getOrCreate()
+    val inputPath = "C:/Users/abc/Downloads/sql_mapping_template.xlsx"
+    val outputPath = "C:/Users/abc/Downloads/generated_struct.sql"
+
+    val df = spark.read
+      .format("com.crealytics.spark.excel")
+      .option("header", "true")
+      .option("inferSchema", "true")
+      .load(inputPath)
+
+    val sqlOutput = generateStructSqlFromMapping(df)
+    println(sqlOutput)
+
+    val writer = new PrintWriter(new File(outputPath))
+    writer.write(sqlOutput)
+    writer.close()
+
+    spark.stop()
+  }
+}
